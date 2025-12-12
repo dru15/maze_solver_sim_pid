@@ -2,268 +2,288 @@ import pygame
 import numpy as np
 import heapq
 
-# --- SETTINGS ---
+# ---------------- SETTINGS ----------------
 CELL = 60
 MAZE_SIZE = 10
 WIDTH, HEIGHT = MAZE_SIZE * CELL, MAZE_SIZE * CELL
 FPS = 40
 
-# --- CONSTANTS ---
-STEP_COST = 1000
-TURN_PENALTY = 5000 
-L_DIST, L_DIR, L_WALL = 0, 1, 2
-WALL_N, WALL_E, WALL_S, WALL_W = 1, 2, 4, 8
+# encoder & costs
+STEP_TICKS = 1000
+TURN_PENALTY = 5000
 
-# --- COLORS ---
-BG_COLOR = (10, 15, 20)
-WALL_COLOR = (0, 255, 255)
-PATH_COLOR = (255, 0, 255)
-ROBOT_COLOR = (255, 255, 0)
-VISITED_COLOR = (20, 40, 60)
-GRID_COLOR = (25, 30, 45)
+# directions: 0=E,1=S,2=W,3=N
+DIRS = [(1,0),(0,1),(-1,0),(0,-1)]
+DIR_NAMES = ["E", "S", "W", "N"]
 
+# turn mask bits: N=1, E=2, S=4, W=8
+BIT_N, BIT_E, BIT_S, BIT_W = 1,2,4,8
+
+# colors
+BG = (12,12,20)
+GRID = (30,35,50)
+VISITED = (24,28,40)
+NODE_COLOR = (255,200,50)
+EDGE_COLOR = (60,200,120)
+PATH_COLOR = (255,0,200)
+ROBOT_COLOR = (255,255,80)
+TEXT_COLOR = (200,200,220)
+
+# ---------------- MAZE ----------------
 def get_maze_layout():
-    # 10x10 Complex Room Maze
     return np.array([
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 0, 0, 1, 0, 0, 0, 0, 0, 1], 
-        [1, 0, 1, 1, 0, 1, 1, 1, 0, 1], 
-        [1, 0, 0, 0, 0, 0, 0, 1, 0, 1], 
-        [1, 1, 1, 0, 1, 1, 0, 1, 0, 1], 
-        [1, 0, 0, 0, 0, 0, 0, 0, 0, 1], 
-        [1, 0, 1, 1, 1, 1, 1, 1, 0, 1], 
-        [1, 0, 0, 0, 0, 0, 0, 0, 0, 1], 
-        [1, 0, 1, 1, 0, 1, 1, 1, 0, 1], 
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        [1,1,1,1,1,1,1,1,1,1],
+        [1,0,0,0,0,0,1,0,0,1],
+        [1,0,1,1,1,0,1,0,1,1],
+        [1,0,0,0,1,0,0,0,0,1],
+        [1,1,1,0,1,1,1,1,0,1],
+        [1,0,0,0,0,0,0,1,0,1],
+        [1,0,1,1,1,1,0,1,0,1],
+        [1,0,0,0,0,0,0,1,0,1],
+        [1,0,1,1,1,1,0,0,0,1],
+        [1,1,1,1,1,1,1,1,1,1]
     ])
 
-class Robot:
-    def __init__(self, start):
+# ---------------- Robot / Explorer ----------------
+class LFRExplorer:
+    def __init__(self, start=(1,1)):
         self.x, self.y = start
-        self.dir = (1, 0)
+        self.mem_walls = np.full((MAZE_SIZE, MAZE_SIZE), 15, dtype=int)
+        self.visited_cells = set()
+        self.visited_cells.add((self.x, self.y))
 
-        # 3D Memory: [Distance, Direction, Walls]
-        self.mem = np.zeros((MAZE_SIZE, MAZE_SIZE, 3), dtype=int)
-        self.mem[:, :, L_WALL] = 15 # Init as Unknown
+        # Node Graph Data
+        self.cell_to_node = {}      # (x,y) -> node_id
+        self.node_to_cell = []      # node_id -> (x,y)
+        self.edges = {}             # edges[node_A][node_B] = distance
 
-        self.visited = set()
-        self.visited.add((self.x, self.y))
-        
-        # Initialize start cell
-        self.mem[self.y][self.x][L_DIST] = 0
-        self.mem[self.y][self.x][L_WALL] = 0 # Assume open start for this demo
+        self.current_node = None    
+        self.last_node = None       
+        self.dist_acc = 0           
+
+        self.walking = False
+        self.walk_dir = None        
+        self.walk_from_node = None  
 
         self.stack = []
         self.finished = False
-        self.final_path = []
 
-    # ==========================================================
-    #  THE "BRAIN" FUNCTION (Port this logic to Arduino)
-    # ==========================================================
-    def explore(self, ticks_measured, current_pos, detected_walls):
-        """
-        Takes raw sensor data and updates the internal map.
-        
-        Args:
-            ticks_measured (int): Value from encoder since last stop.
-            current_pos (tuple): (x, y) grid coordinates.
-            detected_walls (int): Bitmask of walls sensed at current pos.
-        """
-        cx, cy = current_pos
-        
-        # 1. UPDATE WALLS (Topology Layer)
-        # We perform a bitwise AND to remove walls that don't exist.
-        # Ideally, sensors tell us what IS there. Here we use a negative mask logic
-        # compatible with our previous "Remove Wall" approach.
-        
-        # If we arrived here, the path behind us is definitely open.
-        # (This logic is handled in the move loop in simulation, 
-        # but on Arduino, you'd update based on IR sensors here).
-        
-        # In this simulation, 'detected_walls' is the Truth from the map.
-        # We overwrite our memory with what we see.
-        self.mem[cy][cx][L_WALL] = detected_walls
+    def is_node_cell(self, cell, maze):
+        x,y = cell
+        deg = 0
+        neighbors = []
+        for d,(dx,dy) in enumerate(DIRS):
+            nx,ny = x+dx, y+dy
+            if 0 <= nx < MAZE_SIZE and 0 <= ny < MAZE_SIZE and maze[ny][nx] == 0:
+                deg += 1
+                neighbors.append(d)
+        if deg != 2: return True
+        if len(neighbors) == 2 and (neighbors[0] + 2) % 4 != neighbors[1]:
+            return True
+        return False
 
-        # 2. UPDATE DISTANCE (Cost Layer)
-        # We only record the cost if this is the first visit.
-        if self.mem[cy][cx][L_DIST] == 0 and (cx, cy) != (1,1):
-            self.mem[cy][cx][L_DIST] = int(ticks_measured)
+    def ensure_node(self, cell):
+        if cell in self.cell_to_node:
+            return self.cell_to_node[cell]
+        nid = len(self.node_to_cell)
+        self.cell_to_node[cell] = nid
+        self.node_to_cell.append(cell)
+        self.edges[nid] = {}
+        return nid
 
-        # 3. MARK VISITED
-        self.visited.add((cx, cy))
+    def start_exploration(self, maze):
+        start_cell = (self.x, self.y)
+        nid = self.ensure_node(start_cell)
+        self.current_node = nid
+        self.last_node = nid
+        self.dist_acc = 0
 
-    # ==========================================================
-    #  THE "HARDWARE" SIMULATION (Main Loop)
-    # ==========================================================
-    def move_hardware_simulation(self, real_maze):
-        if self.finished: return
+        # Push valid exits
+        x,y = start_cell
+        for d,(dx,dy) in enumerate(DIRS):
+            nx,ny = x+dx, y+dy
+            if 0 <= nx < MAZE_SIZE and 0 <= ny < MAZE_SIZE and maze[ny][nx] == 0:
+                self.stack.append((nid, d))
 
-        cx, cy = self.x, self.y
-        
-        # --- 1. SENSE SURROUNDINGS (Simulating Sensors) ---
-        # In real life, you would read IR sensors here.
-        # Here, we peek at the 'real_maze' array.
-        valid_neighbors = []
-        
-        # Check Right, Down, Left, Up
-        for dx, dy in [(1,0), (0,1), (-1,0), (0,-1)]:
-            nx, ny = cx+dx, cy+dy
-            if 0 <= nx < MAZE_SIZE and 0 <= ny < MAZE_SIZE:
-                # If path is open (0)
-                if real_maze[ny][nx] == 0: 
-                    # If not visited, it's a candidate for exploration
-                    if (nx,ny) not in self.visited:
-                        valid_neighbors.append((nx, ny))
+    def start_walk(self, dir_to_walk):
+        self.walking = True
+        self.walk_dir = dir_to_walk
+        self.walk_from_node = self.current_node
 
-        # --- 2. DECIDE MOVEMENT (DFS Logic) ---
-        next_pos = None
-        if valid_neighbors:
-            next_pos = valid_neighbors[0]
-            self.stack.append((cx, cy))
-        elif self.stack:
-            next_pos = self.stack.pop()
-        else:
-            self.finished = True
-            self.solve_grid_astar((1,1), (8,8))
+    def step_walk_one_cell(self, maze):
+        dx,dy = DIRS[self.walk_dir]
+        nx,ny = self.x + dx, self.y + dy
+
+        if not (0 <= nx < MAZE_SIZE and 0 <= ny < MAZE_SIZE and maze[ny][nx] == 0):
+            self.walking = False
             return
 
-        # --- 3. EXECUTE MOVE (Simulate Motors) ---
-        # Robot drives to next_pos...
-        # ...
-        # Robot Arrives.
-        
-        # --- 4. SIMULATE ENCODER READING ---
-        # Encoder says: "I spun 1000 ticks to get here"
-        simulated_encoder_value = STEP_COST 
-        
-        # --- 5. SIMULATE WALL SENSORS ---
-        # To make the map accurate, we need to calculate the wall mask
-        # for the NEW position we just arrived at.
-        nx, ny = next_pos
-        wall_mask = 0
-        if ny > 0 and real_maze[ny-1][nx] == 1: wall_mask += WALL_N
-        if nx < MAZE_SIZE-1 and real_maze[ny][nx+1] == 1: wall_mask += WALL_E
-        if ny < MAZE_SIZE-1 and real_maze[ny+1][nx] == 1: wall_mask += WALL_S
-        if nx > 0 and real_maze[ny][nx-1] == 1: wall_mask += WALL_W
-        
-        # We must also ensure the path we just came from is OPEN in the mask
-        dx = nx - cx
-        dy = ny - cy
-        if dx == 1: wall_mask &= ~WALL_W # Came from West, so West is open
-        elif dx == -1: wall_mask &= ~WALL_E
-        elif dy == 1: wall_mask &= ~WALL_N
-        elif dy == -1: wall_mask &= ~WALL_S
+        self.x, self.y = nx, ny
+        self.visited_cells.add((self.x, self.y))
+        self.dist_acc += STEP_TICKS
 
-        # --- 6. CALL THE BRAIN FUNCTION ---
-        self.explore(simulated_encoder_value, next_pos, wall_mask)
-        
-        # Update physical position
-        self.x, self.y = next_pos
-
-        # Update previous cell's walls too (Bidirectional logic)
-        # In reality, you'd do this when LEAVING the previous cell.
-        prev_mask = self.mem[cy][cx][L_WALL]
-        if dx == 1: prev_mask &= ~WALL_E
-        elif dx == -1: prev_mask &= ~WALL_W
-        elif dy == 1: prev_mask &= ~WALL_S
-        elif dy == -1: prev_mask &= ~WALL_N
-        self.mem[cy][cx][L_WALL] = prev_mask
-
-    def solve_grid_astar(self, start, goal):
-        pq = [(0, start, (0,0))]
-        g_scores = {}
-        g_scores[(start, (0,0))] = 0
-        came_from = {} 
-        final_state = None
-
-        while pq:
-            cost, curr, arr_dir = heapq.heappop(pq)
-            if curr == goal:
-                final_state = (curr, arr_dir); break
-
-            cx, cy = curr
-            walls = self.mem[cy][cx][L_WALL]
+        if self.is_node_cell((self.x, self.y), maze):
+            nid = self.ensure_node((self.x, self.y))
             
-            for i, (dx, dy) in enumerate([(1,0), (0,1), (-1,0), (0,-1)]):
-                mask = [WALL_E, WALL_S, WALL_W, WALL_N][i]
-                if not (walls & mask):
-                    nx, ny = cx + dx, cy + dy
-                    new_cost = cost + STEP_COST
-                    if arr_dir != (0,0) and (dx, dy) != arr_dir:
-                        new_cost += TURN_PENALTY
-                    
-                    state = ((nx, ny), (dx, dy))
-                    if new_cost < g_scores.get(state, float('inf')):
-                        g_scores[state] = new_cost
-                        came_from[state] = (curr, arr_dir)
-                        h = (abs(nx - goal[0]) + abs(ny - goal[1])) * STEP_COST
-                        heapq.heappush(pq, (new_cost + h, (nx, ny), (dx, dy)))
+            # Record Edge
+            a, b = self.walk_from_node, nid
+            ticks = self.dist_acc if self.dist_acc>0 else STEP_TICKS
+            self.edges.setdefault(a, {})[b] = ticks
+            self.edges.setdefault(b, {})[a] = ticks
 
-        if final_state:
-            self.final_path = []
-            curr_key = final_state
-            while curr_key in came_from:
-                self.final_path.append(curr_key[0])
-                curr_key = came_from[curr_key]
-            self.final_path.append(start)
-            self.final_path.reverse()
-            self.print_matrix()
+            self.last_node = a
+            self.current_node = b
+            self.dist_acc = 0
+            self.walking = False
 
-    def print_matrix(self):
-        print("\n// ---- ARDUINO MATRIX ----")
-        print(f"int maze[{MAZE_SIZE}][{MAZE_SIZE}][3] = {{")
-        for y in range(MAZE_SIZE):
-            print("  {", end="")
-            for x in range(MAZE_SIZE):
-                d = self.mem[y][x][L_DIST]
-                w = self.mem[y][x][L_WALL]
-                print(f"{{{d},0,{w}}}", end="")
-                if x < MAZE_SIZE-1: print(", ", end="")
-            print("},")
+            # Add new tasks
+            x0,y0 = self.node_to_cell[b]
+            for d,(dx,dy) in enumerate(DIRS):
+                nx2, ny2 = x0+dx, y0+dy
+                if 0 <= nx2 < MAZE_SIZE and 0 <= ny2 < MAZE_SIZE and maze[ny2][nx2] == 0:
+                    # Don't go back immediately
+                    back_dx, back_dy = DIRS[(self.walk_dir+2)%4]
+                    if (nx2,ny2) == (x0+back_dx, y0+back_dy): continue
+                    self.stack.append((b,d))
+
+    def exploration_step(self, maze):
+        if self.current_node is None:
+            self.start_exploration(maze)
+            return
+
+        if self.walking:
+            self.step_walk_one_cell(maze)
+            return
+
+        if not self.stack:
+            self.finished = True
+            return
+
+        node_id, dir_to_explore = self.stack.pop()
+        
+        if node_id != self.current_node:
+            tx,ty = self.node_to_cell[node_id]
+            self.x, self.y = tx, ty
+            self.current_node = node_id
+        
+        self.start_walk(dir_to_explore)
+
+    # ---------------- 3D ADJACENCY MATRIX GENERATOR ----------------
+    def print_adjacency_matrix(self):
+        n = len(self.node_to_cell)
+        print(f"\n// --- 3D ADJACENCY MATRIX ({n} Nodes) ---")
+        print("// Format: {Distance, Dir_Index, Turn_Mask}")
+        print(f"// Nodes: {n}, Directions: 4, Data: 3")
+        print(f"int graph[{n}][4][3] = {{")
+        
+        for i in range(n):
+            cx, cy = self.node_to_cell[i]
+            
+            # 1. Calculate Turn Mask for this Node
+            # (Check all connected neighbors)
+            mask = 0
+            neighbors = self.edges.get(i, {})
+            
+            # Also check which directions have edges
+            # We map neighbors to directions E, S, W, N
+            dir_map = {} # Dir_Index -> Neighbor_ID
+            
+            for nb_id in neighbors:
+                nx, ny = self.node_to_cell[nb_id]
+                dx, dy = nx - cx, ny - cy
+                
+                # Determine direction of neighbor
+                d_idx = -1
+                if dx > 0: d_idx = 0   # East
+                elif dy > 0: d_idx = 1 # South
+                elif dx < 0: d_idx = 2 # West
+                elif dy < 0: d_idx = 3 # North
+                
+                if d_idx != -1:
+                    dir_map[d_idx] = nb_id
+                    # Update mask
+                    if d_idx == 0: mask |= BIT_E
+                    elif d_idx == 1: mask |= BIT_S
+                    elif d_idx == 2: mask |= BIT_W
+                    elif d_idx == 3: mask |= BIT_N
+
+            # 2. Print Rows for E, S, W, N
+            print(f"  // Node {i} {self.node_to_cell[i]}")
+            print("  {")
+            for d in range(4):
+                if d in dir_map:
+                    nb = dir_map[d]
+                    dist = neighbors[nb]
+                    print(f"    {{{dist}, {d}, {mask}}}", end="")
+                else:
+                    print(f"    {{0, 0, 0}}", end="")
+                
+                if d < 3: print(",")
+                else: print("")
+            
+            print("  }", end="")
+            if i < n-1: print(",")
+            print("")
+            
         print("};")
+
+# ---------------- PYGAME VISUAL ----------------
+def draw_grid(screen):
+    for i in range(MAZE_SIZE+1):
+        pygame.draw.line(screen, GRID, (0,i*CELL), (WIDTH,i*CELL))
+        pygame.draw.line(screen, GRID, (i*CELL,0), (i*CELL,HEIGHT))
 
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Modular Explorer")
+    pygame.display.set_caption("LFR Graph Generator")
     clock = pygame.time.Clock()
-    
-    real_maze = get_maze_layout()
-    robot = Robot((1,1))
+    font = pygame.font.SysFont("Consolas", 16)
 
-    while True:
+    maze = get_maze_layout()
+    bot = LFRExplorer((1,1))
+
+    running = True
+    printed = False
+
+    while running:
         clock.tick(FPS)
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT: pygame.quit(); return
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT: running = False
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_SPACE: bot.finished = True
+                if ev.key == pygame.K_p:
+                    bot.print_adjacency_matrix()
+                    printed = True
 
-        robot.move_hardware_simulation(real_maze)
+        if not bot.finished:
+            bot.exploration_step(maze)
+        else:
+            if not printed:
+                bot.print_adjacency_matrix()
+                printed = True
 
-        screen.fill(BG_COLOR)
-        
-        # Draw Visited
-        for (x,y) in robot.visited:
-            pygame.draw.rect(screen, VISITED_COLOR, (x*CELL+2, y*CELL+2, CELL-4, CELL-4))
+        screen.fill(BG)
+        draw_grid(screen)
 
-        # Draw Walls from Memory
-        for y in range(MAZE_SIZE):
-            for x in range(MAZE_SIZE):
-                w = robot.mem[y][x][L_WALL]
-                if w == 15: continue
-                px, py = x*CELL, y*CELL
-                if w & WALL_N: pygame.draw.line(screen, WALL_COLOR, (px,py), (px+CELL,py), 2)
-                if w & WALL_E: pygame.draw.line(screen, WALL_COLOR, (px+CELL,py), (px+CELL,py+CELL), 2)
-                if w & WALL_S: pygame.draw.line(screen, WALL_COLOR, (px,py+CELL), (px+CELL,py+CELL), 2)
-                if w & WALL_W: pygame.draw.line(screen, WALL_COLOR, (px,py), (px,py+CELL), 2)
+        # Draw Edges
+        for a, nbrs in bot.edges.items():
+            ax,ay = bot.node_to_cell[a]
+            for b in nbrs:
+                bx,by = bot.node_to_cell[b]
+                pygame.draw.line(screen, EDGE_COLOR, (ax*CELL+30,ay*CELL+30), (bx*CELL+30,by*CELL+30), 4)
 
-        # Draw Path
-        if robot.final_path:
-            pts = [(x*CELL+CELL//2, y*CELL+CELL//2) for (x,y) in robot.final_path]
-            pygame.draw.lines(screen, PATH_COLOR, False, pts, 4)
-            pygame.draw.lines(screen, (255,255,255), False, pts, 1)
+        # Draw Nodes
+        for nid, (nx,ny) in enumerate(bot.node_to_cell):
+            cx, cy = nx*CELL + 30, ny*CELL + 30
+            pygame.draw.circle(screen, NODE_COLOR, (cx,cy), 12)
+            screen.blit(font.render(str(nid), True, TEXT_COLOR), (cx-8, cy-8))
 
-        # Draw Robot
-        pygame.draw.circle(screen, ROBOT_COLOR, (robot.x*CELL+CELL//2, robot.y*CELL+CELL//2), 10)
+        # Robot
+        pygame.draw.circle(screen, ROBOT_COLOR, (bot.x*CELL+30, bot.y*CELL+30), 9)
         pygame.display.flip()
+
+    pygame.quit()
 
 if __name__ == "__main__":
     main()
